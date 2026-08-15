@@ -165,6 +165,26 @@ class ClaudeSession:
                 task.cancel()
         _log("Claude stopped")
 
+    async def reset(self) -> None:
+        """Kill the current persistent process (if any) and clear its state
+        so the next turn spawns a brand-new `claude` with no prior context —
+        it's a fresh invocation, not --resume/--continue, so a new process
+        is inherently a clean conversation."""
+        if self.proc:
+            self.proc.terminate()
+            try:
+                await asyncio.wait_for(self.proc.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                self.proc.kill()
+        for task in [self._stdout_task, self._stderr_task]:
+            if task:
+                task.cancel()
+        self.proc = None
+        self._stdout_task = None
+        self._stderr_task = None
+        self._pending.clear()
+        _log("Claude session reset")
+
 
 # ---------------------------------------------------------------------------
 # sijba plugin protocol (single project channel, self-registered)
@@ -263,10 +283,16 @@ class PluginClient:
             await self.ws.close()
             return True
 
+        if cmd == "reset":
+            await self.session.reset()
+            self.session_started = False
+            await self._reply(channel_id, envelope_id, f"{PROJECT_NAME} reset — next message starts fresh, no prior context.")
+            return True
+
         if cmd:
             await self._reply(
                 channel_id, envelope_id,
-                "Unsupported here: /archive, /pause, /log [n]. Anything else — just plain text.",
+                "Unsupported here: /archive, /pause, /reset, /log [n]. Anything else — just plain text.",
             )
             return True
         return False
