@@ -97,92 +97,110 @@ def _set_registry_status(name: str, status: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Claude backend (persistent subprocess, JSON-lines over stdin/stdout)
+# Claude backend (one-shot `claude -p --resume` per turn, streamed)
+#
+# Earlier versions of this class tried to keep one persistent `claude`
+# process alive and feed it a made-up {"request_id", "text"} JSON protocol
+# over stdin — claude never spoke that protocol at all (verified live: it
+# was actually launching full interactive mode against piped, non-tty
+# stdin/stdout, understanding none of what was written to it), so every
+# single message timed out after 120s with no exception. The real
+# non-interactive interface is `-p --output-format stream-json --verbose`
+# (verbose is mandatory for print+stream-json, claude errors out without
+# it) plus `--resume <session_id>` for continuation — one invocation per
+# turn, same shape as CursorSession below, confirmed against a real
+# `claude -p` run.
 # ---------------------------------------------------------------------------
 
 class ClaudeSession:
     def __init__(self, work_dir: Path):
         self.work_dir = work_dir
-        self.proc: asyncio.subprocess.Process | None = None
-        self._pending: dict[int, asyncio.Future] = {}
-        self._stdout_task: asyncio.Task | None = None
-        self._stderr_task: asyncio.Task | None = None
+        self.claude_session_id: str | None = None
 
     async def start(self):
-        self.proc = await asyncio.create_subprocess_exec(
-            CLAUDE_CMD,
-            "--dangerously-skip-permissions",
-            "--model", "sonnet",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=self.work_dir,
-        )
-        self._stdout_task = asyncio.create_task(self._read_stdout())
-        self._stderr_task = asyncio.create_task(self._read_stderr())
-        _log(f"Claude started (pid={self.proc.pid})")
-
-    async def _read_stdout(self):
-        while self.proc and self.proc.stdout:
-            line = await self.proc.stdout.readline()
-            if not line:
-                break
-            try:
-                msg = json.loads(line.decode())
-                req_id = msg.get("request_id")
-                if req_id in self._pending:
-                    self._pending[req_id].set_result(msg)
-                    del self._pending[req_id]
-            except json.JSONDecodeError:
-                pass
-
-    async def _read_stderr(self):
-        while self.proc and self.proc.stderr:
-            line = await self.proc.stderr.readline()
-            if not line:
-                break
-            _log(f"stderr: {line.decode().strip()}")
+        _log("Claude session ready (conversation mode)")
 
     async def send(self, text: str, request_id: int, on_chunk=None) -> dict:
-        if not self.proc or not self.proc.stdin:
-            raise RuntimeError("Claude process not running")
-        future = asyncio.get_event_loop().create_future()
-        self._pending[request_id] = future
-        payload = {"request_id": request_id, "text": text}
-        self.proc.stdin.write((json.dumps(payload) + "\n").encode())
-        await self.proc.stdin.drain()
+        cmd = [
+            CLAUDE_CMD, "-p", "--dangerously-skip-permissions", "--model", "sonnet",
+            "--output-format", "stream-json", "--include-partial-messages", "--verbose",
+        ]
+        if self.claude_session_id:
+            cmd += ["--resume", self.claude_session_id]
+        cmd += [text]
+
+        proc = None
         try:
-            return await asyncio.wait_for(future, timeout=120)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.work_dir,
+            )
+            final_text = ""
+            stderr_buf = bytearray()
+
+            async def _pump_stdout() -> None:
+                nonlocal final_text
+                while True:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        break
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    etype = event.get("type")
+
+                    if etype == "system" and event.get("subtype") == "init":
+                        if event.get("session_id"):
+                            self.claude_session_id = event["session_id"]
+
+                    elif etype == "stream_event":
+                        inner = event.get("event") or {}
+                        if inner.get("type") == "content_block_delta":
+                            delta_text = (inner.get("delta") or {}).get("text", "")
+                            if delta_text and on_chunk:
+                                await on_chunk(delta_text)
+
+                    elif etype == "result":
+                        final_text = event.get("result", "")
+                        if event.get("session_id"):
+                            self.claude_session_id = event["session_id"]
+
+            async def _pump_stderr() -> None:
+                while True:
+                    chunk = await proc.stderr.read(4096)
+                    if not chunk:
+                        break
+                    stderr_buf.extend(chunk)
+
+            await asyncio.wait_for(
+                asyncio.gather(_pump_stdout(), _pump_stderr()), timeout=600
+            )
+            await proc.wait()
+
+            if stderr_buf:
+                _log(f"stderr: {bytes(stderr_buf).decode(errors='replace').strip()}")
+
+            return {"text": final_text or "(no output)", "request_id": request_id}
+
         except asyncio.TimeoutError:
-            raise RuntimeError("Claude response timeout")
+            if proc and proc.returncode is None:
+                proc.kill()
+            return {"text": "Error: Claude timeout (600s)", "request_id": request_id}
+        except Exception as exc:
+            if proc and proc.returncode is None:
+                proc.kill()
+            return {"text": f"Error: {exc}", "request_id": request_id}
 
     async def close(self):
-        if self.proc:
-            self.proc.terminate()
-            await self.proc.wait()
-        for task in [self._stdout_task, self._stderr_task]:
-            if task:
-                task.cancel()
-        _log("Claude stopped")
+        _log("Claude session closed")
 
     async def reset(self) -> None:
-        """Kill the current persistent process (if any) and clear its state
-        so the next turn spawns a brand-new `claude` with no prior context —
-        it's a fresh invocation, not --resume/--continue, so a new process
-        is inherently a clean conversation."""
-        if self.proc:
-            self.proc.terminate()
-            try:
-                await asyncio.wait_for(self.proc.wait(), timeout=10)
-            except asyncio.TimeoutError:
-                self.proc.kill()
-        for task in [self._stdout_task, self._stderr_task]:
-            if task:
-                task.cancel()
-        self.proc = None
-        self._stdout_task = None
-        self._stderr_task = None
-        self._pending.clear()
+        """Drop the remembered session id — the next turn omits --resume,
+        so claude starts a brand-new conversation instead of continuing."""
+        self.claude_session_id = None
         _log("Claude session reset")
 
 
@@ -318,11 +336,19 @@ class PluginClient:
             await self.session.start()
             self.session_started = True
 
+        async def _on_chunk(delta: str) -> None:
+            try:
+                await self.ws.send(json.dumps({
+                    "type": "reply_chunk", "channel": channel_id, "envelope_id": envelope_id, "text": delta,
+                }))
+            except Exception as exc:
+                _log(f"Failed to send reply_chunk: {exc}")
+
         _log(f"handling envelope={envelope_id} text={text[:120]!r}")
         self._request_id += 1
         reply_text = ""
         try:
-            response = await self.session.send(text, request_id=self._request_id)
+            response = await self.session.send(text, request_id=self._request_id, on_chunk=_on_chunk)
             reply_text = response.get("text", "")
         except Exception as exc:
             reply_text = f"Error: {exc}"
