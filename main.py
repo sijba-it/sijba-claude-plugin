@@ -112,6 +112,47 @@ def _set_registry_status(name: str, status: str) -> None:
 # `claude -p` run.
 # ---------------------------------------------------------------------------
 
+# Chat bubbles aren't the place for a raw multi-KB/MB blob (a tool result
+# embedding a big file read, a huge diff, ...) — cap what actually reaches
+# sijba, independent of how large the underlying event was.
+MAX_CHARS_TO_UI = 8000
+
+
+def _truncate(text: str, limit: int = MAX_CHARS_TO_UI) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n…[truncated, {len(text) - limit} more chars]"
+
+
+async def _iter_json_lines(stream: asyncio.StreamReader):
+    """Yield complete newline-delimited lines with no hard size limit.
+
+    `StreamReader.readline()` has a fixed buffer limit (64KiB by default)
+    and *raises* LimitOverrunError if a single line exceeds it before the
+    separator is found — which happened live: a JSON-lines event with a
+    large embedded file/diff blew past that, and the exception replaced
+    the whole in-progress reply with an error instead of just being one
+    long event. Read raw chunks and split on our own unbounded buffer
+    instead — a huge line just accumulates in memory (bounded only by
+    what's actually available, not an arbitrary fixed ceiling) rather than
+    blowing up the read.
+    """
+    buf = bytearray()
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            if buf:
+                yield bytes(buf)
+            return
+        buf.extend(chunk)
+        while True:
+            idx = buf.find(b"\n")
+            if idx < 0:
+                break
+            yield bytes(buf[:idx])
+            del buf[: idx + 1]
+
+
 class ClaudeSession:
     def __init__(self, work_dir: Path):
         self.work_dir = work_dir
@@ -136,26 +177,16 @@ class ClaudeSession:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.work_dir,
-                # asyncio's StreamReader default line-length limit is 64KiB —
-                # one JSON-lines event carrying a large file read/diff/tool
-                # result easily exceeds that, and readline() then raises
-                # LimitOverrunError ("Separator is found, but chunk is
-                # longer than limit") mid-stream, wiping out whatever had
-                # already streamed to the user with that error text instead.
-                limit=10 * 1024 * 1024,
             )
             final_text = ""
             stderr_buf = bytearray()
 
             async def _pump_stdout() -> None:
                 nonlocal final_text
-                while True:
-                    line = await proc.stdout.readline()
-                    if not line:
-                        break
+                async for line in _iter_json_lines(proc.stdout):
                     try:
                         event = json.loads(line)
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
                     etype = event.get("type")
 
@@ -168,10 +199,10 @@ class ClaudeSession:
                         if inner.get("type") == "content_block_delta":
                             delta_text = (inner.get("delta") or {}).get("text", "")
                             if delta_text and on_chunk:
-                                await on_chunk(delta_text)
+                                await on_chunk(_truncate(delta_text))
 
                     elif etype == "result":
-                        final_text = event.get("result", "")
+                        final_text = _truncate(event.get("result", ""))
                         if event.get("session_id"):
                             self.claude_session_id = event["session_id"]
 
