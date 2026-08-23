@@ -49,7 +49,7 @@ SIJBA_TOKEN = os.environ.get("SIJBA_TOKEN", "")
 PROJECT_NAME = os.environ.get("PROJECT_NAME", "")
 WORK_DIR = Path(os.environ.get("WORK_DIR", ""))
 REGISTRY_FILE = os.environ.get("REGISTRY_FILE", "")
-CLAUDE_CMD = os.environ.get("CLAUDE_CMD", "claude")
+CLAUDE_CMD = os.environ.get("CLAUDE_CMD", str(Path.home() / ".local" / "bin" / "claude"))
 
 if not SIJBA_TOKEN:
     print("ERROR: SIJBA_TOKEN environment variable required", file=sys.stderr)
