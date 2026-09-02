@@ -260,8 +260,22 @@ class ClaudeSession:
             )
             await proc.wait()
 
-            if stderr_buf:
-                _log(f"stderr: {bytes(stderr_buf).decode(errors='replace').strip()}")
+            stderr_text = bytes(stderr_buf).decode(errors="replace").strip()
+            if stderr_text:
+                _log(f"stderr: {stderr_text}")
+
+            # claude exited non-zero with no `result` (login expired, quota,
+            # crash, broken --resume, ...) — surface the real error instead of
+            # "(no output)", and drop the session id so the next turn starts
+            # clean rather than re-resuming a bad state.
+            if proc.returncode != 0 and not final_text:
+                self.claude_session_id = None
+                detail = stderr_text or f"exited {proc.returncode}, no output"
+                _log(f"invocation failed (exit {proc.returncode}) — session reset")
+                return {
+                    "text": f"Error: claude failed — {_truncate(detail, 800)}",
+                    "request_id": request_id,
+                }
 
             return {"text": final_text or "(no output)", "request_id": request_id}
 
