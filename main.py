@@ -277,9 +277,7 @@ class ClaudeSession:
                     "request_id": request_id,
                 }
 
-            # Empty on a clean exit = the agent did its work silently. Return
-            # as-is; sijba drops a silent reply instead of pushing "(no output)".
-            return {"text": final_text, "request_id": request_id}
+            return {"text": final_text or "(no output)", "request_id": request_id}
 
         except asyncio.TimeoutError:
             if proc and proc.returncode is None:
